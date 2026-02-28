@@ -1,41 +1,25 @@
-﻿#include <QtCore/qdatastream.h>
-#include <QtCore/qloggingcategory.h>
-#include "discovery.h"
+﻿#include "discovery.h"
 #include "peer.h"
 
+#include <QtCore/qloggingcategory.h>
+#include <QtCore/qdir.h>
+#include <QtNetwork/qhostaddress.h>
+
 static Q_LOGGING_CATEGORY(logger, "lafdup.discovery");
-using namespace qtng;
+
 const quint16 DefaultPort = 7951;
-const quint16 MagicNumber = DefaultPort;
-const quint8 CurrentVersion = 1;
-
-LafdupKcpSocket::LafdupKcpSocket(LafdupDiscovery *parent)
-    : KcpSocket(HostAddress::IPv4Protocol)
-    , parent(parent)
-{
-}
-
-bool LafdupKcpSocket::filter(char *data, qint32 *len, HostAddress *addr, quint16 *port)
-{
-    const QByteArray &packet = QByteArray::fromRawData(data, *len);
-    if (packet.startsWith("\x1f\x0f")) {  // MagicCode
-        parent->handleDiscoveryRequest(packet, *addr, *port);
-        return true;
-    }
-    if (packet.startsWith("\xcd\x1f\x0f")) {  // packet previous version sent.
-        return true;
-    }
-    return false;
-}
 
 LafdupDiscovery::LafdupDiscovery(const QByteArray &uuid, quint16 port, LafdupPeer *parent)
-    : operations(new CoroutineGroup())
+    : QObject(parent)
+    , kcpSocket(new qtng::KcpSocket(qtng::HostAddress::IPv4Protocol))
+    , dnsServer(new qtng::DnsServer(this))
+    , operations(new qtng::CoroutineGroup())
     , uuid(uuid)
     , parent(parent)
     , port(port)
 {
-    kcpSocket.reset(new LafdupKcpSocket(this));
-    kcpSocket->setOption(Socket::BroadcastSocketOption, true);
+    kcpSocket->setOption(qtng::Socket::BroadcastSocketOption, true);
+    connect(dnsServer.data(), &qtng::DnsServer::messageReceived, this, &LafdupDiscovery::handleQuery);
 }
 
 LafdupDiscovery::~LafdupDiscovery()
@@ -46,57 +30,65 @@ LafdupDiscovery::~LafdupDiscovery()
 bool LafdupDiscovery::start()
 {
     if (operations->has("serve")) {
-        if (Q_UNLIKELY(kcpSocket->state() != Socket::ListeningState)) {
-            qCWarning(logger) << "invalid peer state, kcp socket is dead.";
-        }
-        if (Q_UNLIKELY(!operations->has("discovery"))) {
-            qCWarning(logger) << "invalid peer state, discovery coroutine is dead.";
-        }
+        // 已在运行
         return true;
     }
 
+            // 绑定 KCP 套接字并开始监听
     if (!kcpSocket->bind(port)) {
+        qCWarning(logger) << "Failed to bind KCP socket on port" << port;
         return false;
     }
     kcpSocket->listen(50);
 
+            // 启动接受连接的协程
     operations->spawnWithName("serve", [this] { serve(); });
-    operations->spawnWithName("discovery", [this] { discovery(); });
+
+            // 启动 mDNS 浏览器（发现 _lafdup._tcp.local. 服务）
+    browser.reset(new qtng::Browser(dnsServer.data(), "_lafdup._tcp.local.", nullptr, this));
+    connect(browser.data(), &qtng::Browser::serviceAdded, this, &LafdupDiscovery::onServiceAdded);
+    connect(browser.data(), &qtng::Browser::serviceRemoved, this, &LafdupDiscovery::onServiceRemoved);
+
+            // 启动定期发布定时器（每 60 秒宣告一次本机服务）
+    publishTimer.setInterval(60 * 1000);
+    connect(&publishTimer, &QTimer::timeout, this, &LafdupDiscovery::publishServices);
+    publishTimer.start();
+
+            // 立即发布一次
+    publishServices();
+
+    qCDebug(logger) << "mDNS discovery started for UUID" << uuid;
     return true;
 }
 
 void LafdupDiscovery::stop()
 {
-    operations->killall();
-    kcpSocket.reset(new LafdupKcpSocket(this));
+    publishTimer.stop();
+    browser.reset();          // 停止浏览
+    dnsServer.reset();        // 停止 mDNS 服务器
+    operations->killall();    // 停止 serve 协程
+    kcpSocket.reset(new qtng::KcpSocket(qtng::HostAddress::IPv4Protocol));
+    kcpSocket->setOption(qtng::Socket::BroadcastSocketOption, true);
+    qCDebug(logger) << "mDNS discovery stopped";
 }
 
-void LafdupDiscovery::setExtraKnownPeers(const QSet<QPair<HostAddress, quint16>> &extraKnownPeers)
+void LafdupDiscovery::setExtraKnownPeers(const QSet<QPair<qtng::HostAddress, quint16>> &extraKnownPeers)
 {
     this->extraKnownPeers = extraKnownPeers;
+    qCInfo(logger) << "Extra known peers set (mDNS mode: these will be ignored)";
 }
 
-QSet<QPair<HostAddress, quint16>> LafdupDiscovery::getExtraKnownPeers()
+QSet<QPair<qtng::HostAddress, quint16>> LafdupDiscovery::getExtraKnownPeers()
 {
     return extraKnownPeers;
-}
-
-QSet<HostAddress> getMyIPs()
-{
-    QSet<HostAddress> addresses;
-    const auto &list = NetworkInterface::allAddresses();
-    for (const HostAddress &addr : list) {
-        addresses.insert(addr);
-    }
-    return addresses;
 }
 
 QStringList LafdupDiscovery::getAllBoundAddresses()
 {
     QStringList addresses;
-    const auto &list = NetworkInterface::allAddresses();
-    for (const HostAddress &addr : list) {
-        if (!addr.isLoopback() && !addr.isMulticast() && addr.protocol() == HostAddress::IPv4Protocol) {
+    const auto list = qtng::NetworkInterface::allAddresses();
+    for (const qtng::HostAddress &addr : list) {
+        if (!addr.isLoopback() && !addr.isMulticast() && addr.protocol() == qtng::HostAddress::IPv4Protocol) {
             addresses.append(addr.toString());
         }
     }
@@ -112,159 +104,191 @@ quint16 LafdupDiscovery::getPort()
     }
 }
 
-quint16 LafdupDiscovery::getDefaultPort()
-{
-    return DefaultPort;
-}
-
 QByteArray LafdupDiscovery::getUuid()
 {
     return uuid;
 }
 
+quint16 LafdupDiscovery::getDefaultPort()
+{
+    return DefaultPort;
+}
 void LafdupDiscovery::serve()
 {
     while (true) {
-        QSharedPointer<KcpSocket> request(kcpSocket->accept());
-        if (request.isNull()) {
-            return;
+        QSharedPointer<qtng::KcpSocket> client(kcpSocket->accept());
+        if (client.isNull()) {
+            return; // 套接字已关闭
         }
-        parent->tryToConnectPeer(request);
+        parent->tryToConnectPeer(client);
     }
 }
 
-void LafdupDiscovery::handleDiscoveryRequest(const QByteArray &packet, HostAddress addr, quint16 port)
+void LafdupDiscovery::publishServices()
 {
-    quint16 magicNumber;
-    quint8 version;
-    quint32 len;
-    QByteArray uuid;
+    qtng::Message msg;
+    msg.setResponse(true);
 
-    QDataStream ds(packet);
-    ds >> magicNumber >> version >> len;
-    if (ds.status() != QDataStream::Ok) {
-        qCInfo(logger) << "got invalid discovery packet.";
-        return;
-    }
-    if (magicNumber != MagicNumber) {
-        qCInfo(logger) << "got datagram with bad magic number: " << magicNumber;
-        return;
-    }
-    if (version != CurrentVersion) {
-        qCInfo(logger) << "version" << version << "is unknown.";
-        return;
-    }
-    if (len > 64) {
-        qCInfo(logger) << "got datagram with bad uuid length: " << len;
-        return;
-    }
-    uuid.resize(static_cast<int>(len));
+    QByteArray serviceType = "_lafdup._tcp.local.";
+    QByteArray instanceName = uuid;
+    QByteArray fullInstanceName = instanceName + "." + serviceType;
+    QByteArray hostName = uuid + ".local.";
 
-    ds.readRawData(uuid.data(), static_cast<int>(len));
-    if (ds.status() != QDataStream::Ok) {
-        qCInfo(logger) << "got invalid discovery packet.";
-        return;
-    }
+            // PTR 记录：服务类型 -> 完整实例名
+    qtng::Record ptr;
+    ptr.setName(serviceType);
+    ptr.setType(qtng::PTR);
+    ptr.setTarget(fullInstanceName);
+    ptr.setTtl(4500);
+    msg.addRecord(ptr);
 
-    if (uuid.isEmpty()) {
-        qCInfo(logger) << "got datagram with empty uuid.";
-        return;
-    }
+            // SRV 记录：完整实例名 -> 目标主机名、端口
+    qtng::Record srv;
+    srv.setName(fullInstanceName);
+    srv.setType(qtng::SRV);
+    srv.setTarget(hostName);
+    srv.setPort(port);
+    srv.setPriority(0);
+    srv.setWeight(0);
+    srv.setTtl(4500);
+    msg.addRecord(srv);
 
-    if (uuid == this->uuid) {
-        return;
-    }
-    const QString &peerName = QString::fromUtf8(uuid);
-    knownPeers.insert(peerName, qMakePair(addr, port));
-    if (parent->hasPeer(peerName)) {
-        return;
-    }
-    if (parent->hasPeer(addr, port)) {
-        return;
-    }
+            // TXT 记录：版本信息（可扩展）
+    qtng::Record txt;
+    txt.setName(fullInstanceName);
+    txt.setType(qtng::TXT);
+    txt.setTtl(4500);
+    txt.addAttribute("version", "1");
+    msg.addRecord(txt);
 
-    parent->tryToConnectPeer(peerName, addr, port);
+            // A/AAAA 记录：将 hostName 解析到本机所有非回环地址
+    const auto addresses = qtng::NetworkInterface::allAddresses();
+    for (const qtng::HostAddress &addr : addresses) {
+        if (addr.isLoopback()) continue;
+        if (addr.protocol() == qtng::HostAddress::IPv4Protocol) {
+            qtng::Record a;
+            a.setName(hostName);
+            a.setType(qtng::A);
+            a.setAddress(addr);
+            a.setTtl(120);
+            msg.addRecord(a);
+        } else if (addr.protocol() == qtng::HostAddress::IPv6Protocol) {
+            qtng::Record aaaa;
+            aaaa.setName(hostName);
+            aaaa.setType(qtng::AAAA);
+            aaaa.setAddress(addr);
+            aaaa.setTtl(120);
+            msg.addRecord(aaaa);
+        }
+    }
+    qCDebug(logger) << "Publishing mDNS service...";
+    dnsServer->sendMessageToAll(msg);
+    qCDebug(logger) << "Published" << msg.records().size() << "records";
 }
 
-static QSet<HostAddress> allBroadcastAddresses()
+void LafdupDiscovery::handleQuery(const qtng::Message &query)
 {
-    QSet<HostAddress> addresses;
-    addresses.insert(HostAddress::Broadcast);
-    const auto &listall = NetworkInterface::allInterfaces();
-    for (const NetworkInterface &interface : listall) {
-        const auto &listadd = interface.addressEntries();
-        for (const NetworkAddressEntry &entry : listadd) {
-            const HostAddress &addr = entry.broadcast();
-            if (!addr.isNull()) {
-                addresses.insert(addr);
-            }
-        }
-    }
-    return addresses;
-}
+    if (query.isResponse()) return;   // 只处理查询
+    qCDebug(logger) << "Received query from" << query.address() << "with" << query.queries().size() << "questions";
+    qtng::Message reply;
+    reply.reply(query);
 
-void LafdupDiscovery::discovery()
-{
-    QByteArray packet;
-    QDataStream ds(&packet, QIODevice::WriteOnly);
-    ds << DefaultPort << CurrentVersion << uuid;
-    if (ds.status() != QDataStream::Ok) {
-        qCCritical(logger) << "can not make discovery packet.";
-        return;
-    }
-    while (true) {
-        const QSet<HostAddress> &broadcastList = allBroadcastAddresses();
-        for (const HostAddress &addr : broadcastList) {
-            qint32 bs = kcpSocket->udpSend(packet, addr, DefaultPort);
-            if (bs != packet.size()) {
-                qCDebug(logger) << "can not send packet to" << addr << kcpSocket->errorString();
-            } else {
-                qCDebug(logger) << "send to broadcast address: " << addr.toString();
-            }
-        }
-        // prevent undefined behavior if addresses changed while broadcasting.
-        QHash<QString, QPair<HostAddress, quint16>> addresses = this->knownPeers;
-        const auto &list = addresses.keys();
-        for (const QString &peerName : list) {
-            const QPair<HostAddress, quint16> &addr = addresses.value(peerName);
-            if (parent->hasPeer(peerName)) {
-                continue;
-            }
-            if (parent->hasPeer(addr.first, addr.second)) {
-                continue;
-            }
-            qint32 bs = kcpSocket->udpSend(packet, addr.first, addr.second);
-            if (bs != packet.size()) {
-                qCDebug(logger) << "can not send packet to" << addr << kcpSocket->errorString();
-            } else {
-                qCDebug(logger) << "send to known peer: " << addr.first.toString() << ":" << addr.second;
-            }
-        }
+    QByteArray serviceType = "_lafdup._tcp.local.";
+    QByteArray instanceName = uuid;
+    QByteArray fullInstanceName = instanceName + "." + serviceType;
+    QByteArray hostName = uuid + ".local.";
 
-        // prevent undefined behavior if addresses changed while broadcasting.
-        for (const QPair<HostAddress, quint16> &extraKnownPeer : qAsConst(this->extraKnownPeers)) {
-            bool found = false;
-            for (const auto &value : qAsConst(knownPeers)) {
-                if (value == extraKnownPeer) {
-                    found = true;
-                    break;
+    const auto queries = query.queries();
+    for (const qtng::Query &q : queries) {
+        if (q.type() == qtng::PTR && q.name() == serviceType) {
+            qtng::Record ptr;
+            ptr.setName(serviceType);
+            ptr.setType(qtng::PTR);
+            ptr.setTarget(fullInstanceName);
+            ptr.setTtl(4500);
+            reply.addRecord(ptr);
+        } else if (q.type() == qtng::SRV && q.name() == fullInstanceName) {
+            qtng::Record srv;
+            srv.setName(fullInstanceName);
+            srv.setType(qtng::SRV);
+            srv.setTarget(hostName);
+            srv.setPort(port);
+            srv.setPriority(0);
+            srv.setWeight(0);
+            srv.setTtl(4500);
+            reply.addRecord(srv);
+        } else if (q.type() == qtng::TXT && q.name() == fullInstanceName) {
+            qtng::Record txt;
+            txt.setName(fullInstanceName);
+            txt.setType(qtng::TXT);
+            txt.setTtl(4500);
+            txt.addAttribute("version", "1");
+            reply.addRecord(txt);
+        } else if ((q.type() == qtng::A || q.type() == qtng::AAAA) && q.name() == hostName) {
+            const auto addresses = qtng::NetworkInterface::allAddresses();
+            for (const qtng::HostAddress &addr : addresses) {
+                if (addr.isLoopback()) continue;
+                if (addr.protocol() == qtng::HostAddress::IPv4Protocol && q.type() == qtng::A) {
+                    qtng::Record a;
+                    a.setName(hostName);
+                    a.setType(qtng::A);
+                    a.setAddress(addr);
+                    a.setTtl(120);
+                    reply.addRecord(a);
+                } else if (addr.protocol() == qtng::HostAddress::IPv6Protocol && q.type() == qtng::AAAA) {
+                    qtng::Record aaaa;
+                    aaaa.setName(hostName);
+                    aaaa.setType(qtng::AAAA);
+                    aaaa.setAddress(addr);
+                    aaaa.setTtl(120);
+                    reply.addRecord(aaaa);
                 }
             }
-            if (found) {
-                continue;
-            }
-            if (parent->hasPeer(extraKnownPeer.first, extraKnownPeer.second)) {
-                continue;
-            }
-            qint32 bs = kcpSocket->udpSend(packet, extraKnownPeer.first, extraKnownPeer.second);
-            if (bs != packet.size()) {
-                qCDebug(logger) << "can not send packet to" << extraKnownPeer.first.toString() << ":"
-                                << extraKnownPeer.second;
-            } else {
-                qCDebug(logger) << "send to extra known peer: " << extraKnownPeer.first.toString() << ":"
-                                << extraKnownPeer.second;
-            }
         }
-        Coroutine::sleep(5.0);
     }
+
+    if (!reply.records().isEmpty()) {
+        dnsServer->sendMessage(reply);
+    }
+}
+
+void LafdupDiscovery::onServiceAdded(const qtng::Service &service)
+{
+    qCDebug(logger) << "Service added:" << service.name() << service.hostname() << "port" << service.port();
+    QString peerName = service.name();  // 对方的 UUID
+    if (parent->hasPeer(peerName)) return;
+    if (resolvingPeers.contains(peerName)) return;
+
+    resolvingPeers.insert(peerName);
+    QByteArray target = service.hostname();  // 例如 "uuid.local."
+    quint16 peerPort = service.port();
+
+            // 使用 Resolver 解析目标域名获得 IP 地址
+    qtng::Resolver *resolver = new qtng::Resolver(dnsServer.data(), target, nullptr, this);
+    connect(resolver, &qtng::Resolver::resolved, this, [=](const qtng::HostAddress &addr) {
+        if (!parent->hasPeer(peerName) && !parent->hasPeer(addr, peerPort)) {
+            parent->tryToConnectPeer(peerName, addr, peerPort);
+        }
+        resolver->deleteLater();
+        resolvingPeers.remove(peerName);
+    });
+    // 如果解析失败（超时），Resolver 内部会超时并自行销毁，这里只需从 resolvingPeers 移除
+    // 但 Resolver 没有直接发出失败信号，可以用定时器兜底
+    QTimer::singleShot(5000, this, [this, peerName]() {
+        resolvingPeers.remove(peerName);
+    });
+}
+
+void LafdupDiscovery::onServiceRemoved(const qtng::Service &service)
+{
+    QString peerName = service.name();
+    // 可选：从 knownPeers 中移除，并关闭相应连接
+    qCDebug(logger) << "Service removed:" << peerName;
+    // 如果需要，可以通知 parent 关闭对应 Peer
+}
+
+void LafdupDiscovery::onResolved(const qtng::HostAddress &address)
+{
+
+   // 此槽原用于广播解析，现未使用，但可保留以备将来扩展
 }
